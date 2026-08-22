@@ -1,5 +1,6 @@
 package com.unixshells.devbrowser
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Context
@@ -9,9 +10,11 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Environment
-import android.os.Process
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
@@ -22,10 +25,12 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.webkit.*
 import android.widget.*
+import androidx.core.content.ContextCompat
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.PopupMenu
 import android.util.Log
 import java.net.URLEncoder
+import org.json.JSONArray
 
 class MainActivity : AppCompatActivity() {
 
@@ -53,8 +58,9 @@ class MainActivity : AppCompatActivity() {
 
     // State
     private lateinit var tabManager: TabManager
-    private var cdpBridge: CDPBridge? = null
-    private var devToolsServer: DevToolsServer? = null
+    private lateinit var sessionRepository: SessionRepository
+    private val sessionHandler = Handler(Looper.getMainLooper())
+    private val saveSessionRunnable = Runnable { saveSession() }
     private var isDevToolsVisible = false
     private var isTabStripVisible = false
     private var dockMode = DockMode.BOTTOM
@@ -68,6 +74,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         prefs = getSharedPreferences("devbrowser_settings", Context.MODE_PRIVATE)
+        sessionRepository = SessionRepository(applicationContext)
 
         findViews()
         setupWindowInsets()
@@ -81,10 +88,24 @@ class MainActivity : AppCompatActivity() {
         WebView.setWebContentsDebuggingEnabled(true)
 
         startServers()
+        startBrowserForegroundService()
 
-        // Create first tab
-        val intentUrl = intent?.dataString
-        tabManager.createTab(intentUrl ?: "https://www.google.com")
+        // Restore metadata first; only fall back to Google for a genuinely new session.
+        restoreSession(intent?.dataString)
+    }
+
+    private fun startBrowserForegroundService() {
+        val serviceIntent = Intent(this, BrowserForegroundService::class.java).apply {
+            action = BrowserForegroundService.ACTION_START
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
+        }
     }
 
     private fun setupWindowInsets() {
@@ -130,10 +151,10 @@ class MainActivity : AppCompatActivity() {
                 setupDownloadListener(tab.webView)
                 updateTabStrip()
             },
-            onTabListChanged = { updateTabStrip() },
-            onPageStarted = { url -> urlBar.setText(url) },
-            onPageFinished = { url -> urlBar.setText(url) },
-            onTitleChanged = { _ -> updateTabStrip() }
+            onTabListChanged = { updateTabStrip(); scheduleSessionSave() },
+            onPageStarted = { url -> urlBar.setText(url); scheduleSessionSave() },
+            onPageFinished = { url -> urlBar.setText(url); scheduleSessionSave() },
+            onTitleChanged = { _ -> updateTabStrip(); scheduleSessionSave() }
         )
 
         tabManager.updateDesktopMode(prefs.getBoolean("desktop_mode_default", true))
@@ -304,16 +325,57 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startServers() {
-        val pid = Process.myPid()
-        Log.d(TAG, "PID: $pid")
+        BrowserRuntime.start(this, prefs)
+        Log.d(TAG, "Browser runtime generation=${BrowserRuntime.generation()}")
+    }
 
-        val httpPort = prefs.getInt("cdp_http_port", CDP_HTTP_PORT)
-        val wsPort = prefs.getInt("cdp_ws_port", CDP_WS_PORT)
+    private fun restoreSession(intentUrl: String?) {
+        val saved = sessionRepository.load()
+        if (saved == null) {
+            tabManager.createTab(intentUrl ?: "https://www.google.com")
+            return
+        }
 
-        cdpBridge = CDPBridge(httpPort, wsPort).apply { start(pid) }
-        devToolsServer = DevToolsServer(this@MainActivity, DEVTOOLS_PORT).apply { start() }
+        tabManager.updateDesktopMode(saved.desktopMode)
+        saved.tabs.forEach { tab ->
+            tabManager.createTab(
+                url = tab.url,
+                stableId = tab.stableTabId,
+                title = tab.title,
+                scrollX = tab.scrollX,
+                scrollY = tab.scrollY
+            )
+        }
+        saved.activeTabId?.let { activeId ->
+            tabManager.allTabs.indexOfFirst { it.id == activeId }
+                .takeIf { it >= 0 }
+                ?.let(tabManager::switchToTab)
+        }
+        intentUrl?.let { tabManager.createTab(it) }
+    }
 
-        Log.d(TAG, "Servers started - HTTP:$httpPort WS:$wsPort DevTools:$DEVTOOLS_PORT")
+    private fun scheduleSessionSave() {
+        sessionHandler.removeCallbacks(saveSessionRunnable)
+        sessionHandler.postDelayed(saveSessionRunnable, 500L)
+    }
+
+    private fun saveSession() {
+        if (!::tabManager.isInitialized || !::sessionRepository.isInitialized) return
+        sessionRepository.save(
+            SessionRepository.SessionSnapshot(
+                activeTabId = tabManager.activeTabId,
+                desktopMode = tabManager.isDesktopMode,
+                tabs = tabManager.allTabs.map { tab ->
+                    SessionRepository.TabSnapshot(
+                        stableTabId = tab.id,
+                        url = tab.url,
+                        title = tab.title,
+                        scrollX = tab.webView.scrollX,
+                        scrollY = tab.webView.scrollY
+                    )
+                }
+            )
+        )
     }
 
     // ─── DevTools ────────────────────────────────────────
@@ -365,18 +427,18 @@ class MainActivity : AppCompatActivity() {
 
                 Log.d(TAG, "CDP /json response: $json")
 
-                // Parse page entries
-                val idMatch = Regex(""""id"\s*:\s*"([^"]+)"""").findAll(json)
-                val urlMatch = Regex(""""url"\s*:\s*"([^"]+)"""").findAll(json)
-
-                val ids = idMatch.map { it.groupValues[1] }.toList()
-                val urls = urlMatch.map { it.groupValues[1] }.toList()
-
-                // Pick the page that isn't our devtools page
-                var pageId = ids.firstOrNull() ?: ""
-                for (i in ids.indices) {
-                    if (i < urls.size && !urls[i].contains("devtools_app") && !urls[i].contains("9224")) {
-                        pageId = ids[i]
+                // Parse page entries with a real JSON parser; targetId is runtime-only.
+                val targets = JSONArray(json)
+                var pageId = ""
+                for (i in 0 until targets.length()) {
+                    val target = targets.optJSONObject(i) ?: continue
+                    val targetId = target.optString("id")
+                    val targetUrl = target.optString("url")
+                    if (targetId.isNotBlank() &&
+                        !targetUrl.contains("devtools_app") &&
+                        !targetUrl.contains("9224")
+                    ) {
+                        pageId = targetId
                         break
                     }
                 }
@@ -688,9 +750,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        saveSession()
+        sessionHandler.removeCallbacks(saveSessionRunnable)
         super.onDestroy()
-        cdpBridge?.stop()
-        devToolsServer?.stop()
+        // BrowserRuntime is process-scoped and is owned by the service, not Activity.
         devtoolsWebView.destroy()
         tabManager.destroyAll()
     }

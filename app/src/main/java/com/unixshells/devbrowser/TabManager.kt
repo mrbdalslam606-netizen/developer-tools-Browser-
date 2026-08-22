@@ -40,18 +40,30 @@ class TabManager(
         private set
 
     val activeTab: Tab? get() = tabs.getOrNull(activeTabIndex)
+    val activeTabId: Int? get() = activeTab?.id
     val tabCount: Int get() = tabs.size
     val allTabs: List<Tab> get() = tabs.toList()
 
     @SuppressLint("SetJavaScriptEnabled")
-    fun createTab(url: String = "about:blank"): Tab {
+    fun createTab(
+        url: String = "about:blank",
+        stableId: Int? = null,
+        title: String = "New Tab",
+        scrollX: Int = 0,
+        scrollY: Int = 0
+    ): Tab {
         val webView = WebView(context)
         configureWebView(webView)
 
-        val tab = Tab(id = nextId++, webView = webView, url = url)
+        val id = stableId ?: nextId
+        nextId = maxOf(nextId, id + 1)
+        val tab = Tab(id = id, webView = webView, title = title, url = url)
         tabs.add(tab)
         switchToTab(tabs.size - 1)
         webView.loadUrl(url)
+        if (scrollX != 0 || scrollY != 0) {
+            webView.post { webView.scrollTo(scrollX, scrollY) }
+        }
         onTabListChanged()
         return tab
     }

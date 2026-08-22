@@ -19,7 +19,7 @@ android {
 
     defaultConfig {
         applicationId = "com.unixshells.devbrowser"
-        minSdk = 35
+        minSdk = 31
         targetSdk = 35
         versionCode = 3
         versionName = "0.1.0"

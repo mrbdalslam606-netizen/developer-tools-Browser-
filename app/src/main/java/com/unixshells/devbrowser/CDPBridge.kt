@@ -32,7 +32,9 @@ class CDPBridge(
     private var socketName: String? = null
     @Volatile private var running = false
 
+    @Synchronized
     fun start(pid: Int) {
+        if (running) stop()
         socketName = "webview_devtools_remote_$pid"
         running = true
         Log.d(TAG, "Starting CDP bridge - HTTP:$httpPort WS:$wsPort socket:$socketName")
@@ -43,7 +45,9 @@ class CDPBridge(
         Log.d(TAG, "CDP bridge started")
     }
 
+    @Synchronized
     fun stop() {
+        if (!running && httpServer == null && wsServer == null) return
         running = false
         try { httpServer?.close() } catch (_: Exception) {}
         try { wsServer?.close() } catch (_: Exception) {}
